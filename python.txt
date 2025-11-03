@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""
+Thunderbird IMAP INBOX -> date-range archive into Local Folders, then delete from source.
+ 
+Usage (example):
+  python archive_thunderbird_imap_by_date.py ^
+    --imap-dir "C:\Users\<YOU>\AppData\Roaming\Thunderbird\Profiles\<profile>\ImapMail\<server>" ^
+    --local-dir "C:\Users\<YOU>\AppData\Roaming\Thunderbird\Profiles\<profile>\Mail\Local Folders" ^
+    --start 2024-01-01 --end 2024-06-30
+ 
+Notes:
+- Make sure Thunderbird is CLOSED.
+- The script:
+    * Reads IMAP "INBOX" mbox at --imap-dir\INBOX
+    * Creates Local Folders archive: ARCHIVE__{start_to_end}
+    * Touches an empty "archive__{start_to_end}.msf" (Thunderbird will rebuild real indexes)
+    * Deletes matching messages from source INBOX
+    * Removes source "inbox.msf" (or INBOX.msf) to force index rebuild
+- Date comparison uses the message "Date" header. If missing/unparseable, the message is skipped.
+"""
+ 
+import argparse
+import shutil
+import sys
+from pathlib import Path
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import mailbox
+import os
+ 
+def parse_args():
+    p = argparse.ArgumentParser(description="Archive Thunderbird IMAP INBOX by date range into Local Folders.")
+    p.add_argument("--imap-dir", required=True, help="Path to the IMAP account directory containing INBOX (no extension).")
+    p.add_argument("--local-dir", required=True, help="Path to 'Mail\\Local Folders' directory.")
+    p.add_argument("--start", required=True, help="Start date YYYY-MM-DD (inclusive).")
+    p.add_argument("--end", required=True, help="End date YYYY-MM-DD (inclusive).")
+    return p.parse_args()
+ 
+def to_utc(dt):
+    """Ensure a datetime is timezone-aware UTC."""
+    if dt.tzinfo is None:
+        # If header lacked tz info, treat as local time and convert to UTC
+        # Local time -> UTC using system offset at that date/time
+        # Simplest robust approach: assume naive is local and call astimezone(UTC)
+        return dt.astimezone(timezone.utc)
+    return dt.astimezone(timezone.utc)
+ 
+def parse_msg_date(msg):
+    """
+    Parse Date header to UTC datetime.
+    Returns None if unparseable or absent.
+    """
+    date_hdr = msg.get("Date")
+    if not date_hdr:
+        return None
+    try:
+        dt = parsedate_to_datetime(date_hdr)
+        if dt is None:
+            return None
+        return to_utc(dt)
+    except Exception:
+        return None
+ 
+def safe_backup(path: Path):
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bak = path.with_name(f"{path.name}.bak_{ts}")
+    shutil.copy2(path, bak)
+    return bak
+ 
+def main():
+    args = parse_args()
+    imap_dir = Path(args.imap_dir)
+    local_dir = Path(args.local_dir)
+ 
+    src_mbox_path = imap_dir / "INBOX"  # Thunderbird IMAP INBOX mbox (no extension)
+    if not src_mbox_path.exists():
+        print(f"ERROR: Source mbox not found: {src_mbox_path}", file=sys.stderr)
+        sys.exit(1)
+ 
+    # normalize msf name variations (INBOX.msf vs inbox.msf)
+    # we'll try both and remove whichever exists after rewriting
+    src_msf_candidates = [imap_dir / "INBOX.msf", imap_dir / "inbox.msf"]
+ 
+    try:
+        start_dt = datetime.strptime(args.start, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        end_dt = datetime.strptime(args.end, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        print("ERROR: --start/--end must be in YYYY-MM-DD format.", file=sys.stderr)
+        sys.exit(1)
+ 
+    if end_dt < start_dt:
+        print("ERROR: --end must be >= --start.", file=sys.stderr)
+        sys.exit(1)
+ 
+    date_range_str = f"{args.start}_to_{args.end}"
+    dest_mbox_name = f"ARCHIVE__{date_range_str}"
+    dest_mbox_path = local_dir / dest_mbox_name
+    dest_msf_name = f"archive__{date_range_str}.msf"
+    dest_msf_path = local_dir / dest_msf_name
+ 
+    # Safety backups
+    bak_path = safe_backup(src_mbox_path)
+    print(f"Backup created: {bak_path}")
+ 
+    # If destination mbox exists, back it up too
+    if dest_mbox_path.exists():
+        dest_bak = safe_backup(dest_mbox_path)
+        print(f"Destination existed; backup created: {dest_bak}")
+ 
+    # Open mailboxes
+    src_mbox = mailbox.mbox(src_mbox_path, create=False)
+    dest_mbox = mailbox.mbox(dest_mbox_path, create=True)
+ 
+    # Make sure we lock before heavy operations
+    src_mbox.lock()
+    dest_mbox.lock()
+ 
+    matched_keys = []
+    added_count = 0
+    scanned_count = 0
+    skipped_no_date = 0
+    skipped_outside = 0
+ 
+    try:
+        # Iterate over a snapshot of keys to avoid mutation issues
+        for key in list(src_mbox.keys()):
+            scanned_count += 1
+            msg = src_mbox.get(key)
+            msg_dt = parse_msg_date(msg)
+            if msg_dt is None:
+                skipped_no_date += 1
+                continue
+ 
+            if start_dt <= msg_dt <= end_dt:
+                # Add to destination
+                dest_mbox.add(msg)
+                matched_keys.append(key)
+                added_count += 1
+            else:
+                skipped_outside += 1
+ 
+        # Persist destination
+        dest_mbox.flush()
+ 
+        # Delete from source after successful add
+        for key in matched_keys:
+            # Defensive: ensure still present
+            if key in src_mbox:
+                del src_mbox[key]
+ 
+        # Rewrite/flush source to compact
+        src_mbox.flush()
+        src_mbox.close()
+        dest_mbox.close()
+ 
+    finally:
+        # Ensure unlock even if exceptions occur
+        try:
+            src_mbox.unlock()
+        except Exception:
+            pass
+        try:
+            dest_mbox.unlock()
+        except Exception:
+            pass
+ 
+    # Ensure an empty .msf exists for the archive (Thunderbird will rebuild real index)
+    try:
+        dest_msf_path.touch(exist_ok=True)
+    except Exception as e:
+        print(f"WARNING: Could not create {dest_msf_path.name}: {e}", file=sys.stderr)
+ 
+    # Remove the source .msf so Thunderbird rebuilds it (fresh view after deletions)
+    for cand in src_msf_candidates:
+        if cand.exists():
+            try:
+                os.remove(cand)
+                print(f"Removed stale index: {cand}")
+            except Exception as e:
+                print(f"WARNING: Could not remove {cand}: {e}", file=sys.stderr)
+ 
+    print("\n=== Summary ===")
+    print(f"Scanned messages     : {scanned_count}")
+    print(f"Archived (moved)     : {added_count}")
+    print(f"Skipped (no Date)    : {skipped_no_date}")
+    print(f"Skipped (out of range): {skipped_outside}")
+    print(f"Archive mbox         : {dest_mbox_path}")
+    print(f"Archive msf (empty)  : {dest_msf_path}")
+    print(f"Modified source mbox : {src_mbox_path}")
+    print("Next steps: launch Thunderbird; it will rebuild the .msf indexes automatically.")
+    print("If the new archive folder doesn't appear immediately under Local Folders, right-click Local Folders and 'Subscribe'/'Compact Folders' or restart Thunderbird.")
+if __name__ == "__main__":
+    main()
