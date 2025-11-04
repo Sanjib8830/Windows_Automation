@@ -1,0 +1,126 @@
+---
+- name: Thunderbird IMAP auto-archival (up to yesterday)
+  hosts: all
+  gather_facts: no
+
+  vars:
+    # Automatically detect Windows username Ansible connects with
+    user_profile_root: "C:\\Users\\{{ ansible_user }}"
+
+    # Python script Local Path on Controller
+    python_script_src: "/var/lib/jenkins/workspace/playbooks/thunderbird_email_parse.py"
+
+    # Python script destination on Windows
+    python_script_dest: "C:\\thunderbird_email_parse.py"
+
+  pre_tasks:
+    ###########################################################################
+    #  PRE-TASK 1: Verify the user profile root exists
+    ###########################################################################
+    - name: Verify user profile root exists
+      ansible.windows.win_stat:
+        path: "{{ user_profile_root }}"
+      register: user_root_stat
+
+    - name: Fail if user profile root missing
+      ansible.builtin.fail:
+        msg: "User profile root not found: {{ user_profile_root }} (User probably never logged in or wrong username)"
+      when: not user_root_stat.stat.exists
+
+  tasks:
+    ###########################################################################
+    #  TASK 2 - Copy Python archival script from controller → Windows target
+    ###########################################################################
+    - name: Copy Thunderbird archival script to target machine
+      ansible.windows.win_copy:
+        src: "{{ python_script_src }}"
+        dest: "{{ python_script_dest }}"
+
+    ###########################################################################
+    #  TASK 3 - Detect Thunderbird profile path dynamically
+    ###########################################################################
+    - name: Resolve Thunderbird default profile path
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          $iniPath = "{{ user_profile_root }}\\AppData\\Roaming\\Thunderbird\\profiles.ini"
+
+          if (-not (Test-Path $iniPath)) {
+            throw "profiles.ini not found at $iniPath. Open Thunderbird once before running archival."
+          }
+
+          $lines = Get-Content -LiteralPath $iniPath
+          $sections = @(); $name=$null; $data=@{}
+          foreach ($line in $lines) {
+            if ($line -match '^\s*\[(.+?)\]\s*$') {
+              if ($name) { $sections += [pscustomobject]@{Name=$name; Data=$data} }
+              $name=$Matches[1]; $data=@{}; continue
+            }
+            if ($line -match '^\s*([^=]+?)\s*=\s*(.*)\s*$') {
+              $k=$Matches[1].Trim(); $v=$Matches[2].Trim(); $data[$k]=$v
+            }
+          }
+
+          if ($name) { $sections += [pscustomobject]@{Name=$name; Data=$data} }
+
+          $profiles = $sections | Where-Object { $_.Name -match '^Profile\d+$' }
+
+          $default = $profiles | Where-Object { $_.Data.Default -eq '1' } | Select-Object -First 1
+          if (-not $default) { $default = $profiles | Select-Object -First 1 }
+
+          $p = $default.Data['Path']
+          $isRel = ($default.Data.IsRelative -eq '1')
+
+          if ($isRel) {
+            $full = Join-Path "{{ user_profile_root }}\\AppData\\Roaming\\Thunderbird" $p
+          } else {
+            $full = $p
+          }
+
+          $full = (Resolve-Path $full).Path
+
+          # Build IMAP and Local path dynamically
+          $imapPath  = Join-Path $full "ImapMail\\icfimap.indostarcapital.com"
+          $localPath = Join-Path $full "Mail\\Local Folders"
+
+          [pscustomobject]@{
+            profile_path = $full
+            imap_dir     = $imapPath
+            local_dir    = $localPath
+          } | ConvertTo-Json -Compress
+      register: tb_profile
+      changed_when: false
+
+    ###########################################################################
+    #  TASK 4 - Run Python archival script
+    ###########################################################################
+    - name: Run Thunderbird email archival script
+      ansible.windows.win_powershell:
+        script: |
+          $ErrorActionPreference = 'Stop'
+
+          $imap = "{{ (tb_profile.stdout | from_json).imap_dir }}"
+          $local = "{{ (tb_profile.stdout | from_json).local_dir }}"
+
+          Write-Host "IMAP Path: $imap"
+          Write-Host "Local Folder Path: $local"
+
+          # Execute Python script
+          python "{{ python_script_dest }}" `
+            --imap-dir "$imap" `
+            --local-dir "$local"
+      register: archive_output
+
+    - name: Show script result
+      debug:
+        var: archive_output.stdout_lines
+
+    ###########################################################################
+    #  TASK 5 - Delete Python script after execution
+    ###########################################################################
+    - name: Remove Python script from target
+      ansible.windows.win_file:
+        path: "{{ python_script_dest }}"
+        state: absent
+
